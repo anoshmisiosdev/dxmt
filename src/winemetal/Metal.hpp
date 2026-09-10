@@ -281,6 +281,11 @@ public:
     ));
   }
 
+  void
+  getInfo(WMTTextureInfo &info) {
+    MTLTexture_getInfo(handle, &info);
+  }
+
   WMTPixelFormat
   pixelFormat() {
     return MTLTexture_pixelFormat(handle);

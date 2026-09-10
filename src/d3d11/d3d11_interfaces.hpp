@@ -1,6 +1,7 @@
 #pragma once
 #include "com/com_guid.hpp"
 #include "d3d11.h"
+#include "d3d11_3.h" // OpenXR interop: D3D11_TEXTURE2D_DESC1 / ID3D11Fence
 
 namespace dxmt {
 class ArgumentEncodingContext;
@@ -62,4 +63,14 @@ DEFINE_COM_INTERFACE("8cc8848d-76c9-4aea-8309-67a5d4c7e0bf",
   virtual void STDMETHODCALLTYPE ReplayEndCounter(
       dxmt::ArgumentEncodingContext *enc) = 0;
   virtual HRESULT STDMETHODCALLTYPE GetCounterData(void *data) = 0;
+};
+
+// OpenXR interop: adopt an external MTLTexture as a D3D11 Texture2D, and extract
+// the MTLSharedEvent behind an ID3D11Fence. Consumed by the wineopenxr bridge for
+// zero-copy frame sharing with the native OpenXR runtime.
+DEFINE_COM_INTERFACE("8b6fc874-7429-430d-8253-522e296cd8e2", IMTLD3D11InteropDevice) : public IUnknown {
+  virtual HRESULT STDMETHODCALLTYPE ImportMTLTexture2D(
+      const D3D11_TEXTURE2D_DESC1 *pDesc, uint64_t mtlTexture, ID3D11Texture2D **ppTexture2D
+  ) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetFenceSharedEvent(ID3D11Fence * pFence, uint64_t *pMtlSharedEvent) = 0;
 };

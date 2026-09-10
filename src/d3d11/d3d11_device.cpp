@@ -26,6 +26,7 @@
 #include <memory>
 #include "d3d11_4.h"
 #include "util_win32_compat.h"
+#include "d3d11_metal_interop.hpp"
 
 namespace dxmt {
 
@@ -1400,6 +1401,8 @@ public:
         cmd_queue_(this->device->queue()),
         d3d11_device_(this, adapter, feature_level, feature_flags,
                       *this->device.get()),
+        d3d11_interop_device_(static_cast<IUnknown *>(static_cast<IMTLDXGIDevice *>(this)),
+                              &d3d11_device_),
         video_device_(this) {
     if (adapter_->GetLocalD3DKMT()) {
       D3DKMT_CREATEDEVICE create = {};
@@ -1439,6 +1442,11 @@ public:
         riid == __uuidof(ID3D11Device2) || riid == __uuidof(ID3D11Device3) ||
         riid == __uuidof(ID3D11Device4) || riid == __uuidof(ID3D11Device5)) {
       *ppvObject = ref_and_cast<ID3D11Device>(&d3d11_device_);
+      return S_OK;
+    }
+
+    if (riid == __uuidof(IMTLD3D11InteropDevice)) {
+      *ppvObject = ref_and_cast<IMTLD3D11InteropDevice>(&d3d11_interop_device_);
       return S_OK;
     }
 
@@ -1584,6 +1592,7 @@ private:
   std::unique_ptr<Device> device;
   CommandQueue &cmd_queue_;
   MTLD3D11DeviceImpl d3d11_device_;
+  MTLD3D11InteropDevice d3d11_interop_device_;
   MTLD3D11VideoDevice video_device_;
 };
 

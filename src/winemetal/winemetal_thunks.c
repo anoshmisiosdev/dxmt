@@ -1346,3 +1346,11 @@ MTLDevice_updateSparseTextureMappings(
   UNIX_CALL(146, &params);
   return params.ret != 0;
 }
+
+WINEMETAL_API void
+MTLTexture_getInfo(obj_handle_t texture, struct WMTTextureInfo *info) {
+  struct unixcall_generic_obj_ptr_noret params;
+  params.handle = texture;
+  WMT_MEMPTR_SET(params.arg, info);
+  UNIX_CALL(151, &params);
+}

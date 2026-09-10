@@ -270,6 +270,7 @@ public:
   Rc<TextureAllocation> allocatePlaced(WMT::Heap heap, uint64_t offset,
                                        Flags<TextureAllocationFlag> flags);
   Rc<TextureAllocation> import(mach_port_t mach_port);
+  Rc<TextureAllocation> adopt(WMT::Reference<WMT::Texture> &&texture, const WMTTextureInfo &info);
 
   TextureView &view(TextureViewKey key);
   TextureView &view(TextureViewKey key, TextureAllocation *allocation);

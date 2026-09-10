@@ -2060,4 +2060,7 @@ WINEMETAL_API obj_handle_t MTLDevice_newTileRenderPipelineState(
     obj_handle_t device, const struct WMTTileRenderPipelineInfo *info, obj_handle_t *err_out
 );
 
+// OpenXR interop: query an externally-owned MTLTexture's properties.
+WINEMETAL_API void MTLTexture_getInfo(obj_handle_t texture, struct WMTTextureInfo *info);
+
 #endif

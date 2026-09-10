@@ -5335,6 +5335,18 @@ NTSTATUS _CacheWriter_alloc_init(void *obj);
 NTSTATUS _CacheWriter_set(void *obj);
 NTSTATUS _WMTSetMetalShaderCachePath(void *obj);
 
+// OpenXR interop: read an externally-owned MTLTexture's properties.
+static NTSTATUS
+_MTLTexture_getInfo(void *obj) {
+  struct unixcall_generic_obj_ptr_noret *params = obj;
+  struct WMTTextureInfo *info = params->arg.ptr;
+  id<MTLTexture> texture = (id<MTLTexture>)params->handle;
+  extract_texture_descriptor(texture, info);
+  info->gpu_resource_id = [texture gpuResourceID]._impl;
+  info->mach_port = 0;
+  return STATUS_SUCCESS;
+}
+
 const void *__wine_unix_call_funcs[] = {
     &_NSObject_retain,
     &_NSObject_release,
@@ -5487,6 +5499,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLHeap_newBuffer,
     &_MTLHeap_newTexture,
     &_MTLDevice_heapTextureSizeAndAlign,
+    &_MTLTexture_getInfo,
 };
 
 #ifndef DXMT_NATIVE
@@ -5642,5 +5655,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLHeap_newBuffer,
     &_MTLHeap_newTexture,
     &_MTLDevice_heapTextureSizeAndAlign,
+    &_MTLTexture_getInfo,
 };
 #endif
