@@ -449,10 +449,19 @@ CreateMTLTextureDescriptorInternal(
     } else {
       if (SampleCount > 1) {
         if (!pDevice->GetMTLDevice().supportsTextureSampleCount(SampleCount)) {
-          ERR("CreateMTLTextureDescriptorInternal: sample count ", SampleCount,
-              " is not supported.");
-          return E_INVALIDARG;
+          // Apple GPUs top out at 4x. Some applications ask for more even after
+          // CheckMultisampleQualityLevels reports it unsupported (SteamVR's compositor
+          // asks for 8x), so drop to the highest count this device does support
+          // instead of failing the creation.
+          uint32_t fallback = SampleCount;
+          while (fallback > 1 && !pDevice->GetMTLDevice().supportsTextureSampleCount(fallback))
+            fallback >>= 1;
+          WARN("CreateMTLTextureDescriptorInternal: sample count ", SampleCount, " is not supported, using ",
+               fallback, " instead.");
+          SampleCount = fallback;
         }
+      }
+      if (SampleCount > 1) {
         if (ArraySize > 1) {
           pDescOut->type = WMTTextureType2DMultisampleArray;
           pDescOut->array_length = ArraySize;

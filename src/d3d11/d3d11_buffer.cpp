@@ -4,6 +4,7 @@
 #include "dxmt_dynamic.hpp"
 #include "dxmt_format.hpp"
 #include "d3d11_resource.hpp"
+#include "d3d11_shared_buffer.hpp"
 
 namespace dxmt {
 
@@ -85,7 +86,48 @@ private:
     }
   };
 
+  // Shared buffers: pages come from a named file mapping, see d3d11_shared_buffer.hpp.
+  HANDLE shared_mapping_ = nullptr;
+  void *shared_memory_ = nullptr;
+  D3DKMT_HANDLE local_kmt_ = 0;
+  D3DKMT_HANDLE global_kmt_ = 0;
+
 public:
+  //! Shared buffer: wraps memory the caller mapped from `shared_mapping_`.
+  D3D11Buffer(
+      const tag_buffer::DESC1 *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData, MTLD3D11Device *device,
+      HANDLE sharedMapping, void *sharedMemory, D3DKMT_HANDLE localKmt, D3DKMT_HANDLE globalKmt
+  ) :
+      TResourceBase<tag_buffer>(*pDesc, device),
+      shared_mapping_(sharedMapping),
+      shared_memory_(sharedMemory),
+      local_kmt_(localKmt),
+      global_kmt_(globalKmt) {
+    buffer_ = new Buffer(pDesc->ByteWidth, device->GetMTLDevice());
+    Flags<BufferAllocationFlag> flags;
+    flags.set(BufferAllocationFlag::GpuManaged);
+    auto allocation = buffer_->allocateExternalCpu(flags, sharedMemory);
+    if (pInitialData)
+      allocation->updateContents(0, pInitialData->pSysMem, pDesc->ByteWidth);
+    auto _ = buffer_->rename(std::move(allocation));
+    D3D11_ASSERT(_.ptr() == nullptr);
+    structured = pDesc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    allow_raw_view = pDesc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+  }
+
+  ~D3D11Buffer() {
+    if (local_kmt_) {
+      D3DKMT_DESTROYALLOCATION destroy = {};
+      destroy.hDevice = this->m_parent->GetLocalD3DKMT();
+      destroy.hResource = local_kmt_;
+      D3DKMTDestroyAllocation(&destroy);
+    }
+    if (shared_memory_)
+      UnmapViewOfFile(shared_memory_);
+    if (shared_mapping_)
+      CloseHandle(shared_mapping_);
+  }
+
   D3D11Buffer(const tag_buffer::DESC1 *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData, MTLD3D11Device *device) :
       TResourceBase<tag_buffer>(*pDesc, device) {
     buffer_ = new Buffer(pDesc->ByteWidth, device->GetMTLDevice());
@@ -122,6 +164,58 @@ public:
     if (!(desc.BindFlags & kD3D11OutputBindFlags)) {
       dynamic_ = new DynamicBuffer(buffer_.ptr(), flags);
     }
+  }
+
+  HRESULT
+  GetSharedHandle(HANDLE *pSharedHandle) override {
+    if (pSharedHandle == nullptr || (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE))
+      return E_INVALIDARG;
+
+    if (!(desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))) {
+      *pSharedHandle = NULL;
+      return S_OK;
+    }
+
+    if (!global_kmt_)
+      return E_INVALIDARG;
+
+    *pSharedHandle = reinterpret_cast<HANDLE>(global_kmt_);
+    return S_OK;
+  }
+
+  HRESULT
+  CreateSharedHandle(const SECURITY_ATTRIBUTES *Attributes, DWORD Access, const WCHAR *pName, HANDLE *pNTHandle)
+      override {
+    InitReturnPtr(pNTHandle);
+    if (!local_kmt_)
+      return E_INVALIDARG;
+
+    OBJECT_ATTRIBUTES attr = {};
+    attr.Length = sizeof(attr);
+    attr.SecurityDescriptor = const_cast<SECURITY_ATTRIBUTES *>(Attributes);
+
+    WCHAR buffer[MAX_PATH];
+    UNICODE_STRING name_str;
+    if (pName) {
+      DWORD session, len, name_len = wcslen(pName);
+
+      ProcessIdToSessionId(GetCurrentProcessId(), &session);
+      len = swprintf(buffer, ARRAYSIZE(buffer), L"\\Sessions\\%u\\BaseNamedObjects\\", session);
+      memcpy(buffer + len, pName, (name_len + 1) * sizeof(WCHAR));
+      name_str.MaximumLength = name_str.Length = (len + name_len) * sizeof(WCHAR);
+      name_str.MaximumLength += sizeof(WCHAR);
+      name_str.Buffer = buffer;
+
+      attr.ObjectName = &name_str;
+      attr.Attributes = OBJ_CASE_INSENSITIVE;
+    }
+
+    D3DKMT_HANDLE handles[1] = {local_kmt_};
+    if (D3DKMTShareObjects(1, handles, &attr, Access, pNTHandle)) {
+      ERR("SharedBuffer: Failed to create shared NT handle");
+      return E_FAIL;
+    }
+    return S_OK;
   }
 
   HRESULT
@@ -389,11 +483,92 @@ public:
   }
 };
 
+uint64_t
+SharedBufferBackingSize(const D3D11_BUFFER_DESC &desc) {
+  // Metal wants the host allocation page aligned, and the mapping has to cover the
+  // whole buffer.
+  constexpr uint64_t page = 0x4000; // 16 KiB covers both 4 KiB and 16 KiB page sizes
+  return (uint64_t(desc.ByteWidth) + page - 1) & ~(page - 1);
+}
+
+/*!
+ * Shared buffer: back the buffer with a named file mapping so other processes (and
+ * other devices in this one) can map the same pages, and register it with D3DKMT so
+ * a shared handle can be handed out.
+ */
+static HRESULT
+CreateSharedBuffer(
+    MTLD3D11Device *pDevice, const D3D11_BUFFER_DESC *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData,
+    ID3D11Buffer **ppBuffer
+) {
+  if (pDesc->MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) {
+    // A keyed mutex needs a shared GPU event per resource; buffers don't have one yet.
+    WARN("SharedBuffer: keyed mutex is not supported for buffers");
+    return E_INVALIDARG;
+  }
+
+  const bool ntSecuritySharing = pDesc->MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+  char mappingName[54] = {};
+  D3DKMT_HANDLE localKmt = 0;
+  D3DKMT_HANDLE globalKmt = 0;
+  HRESULT hr = CreateSharedBufferKmtResource(pDevice, *pDesc, ntSecuritySharing, mappingName, localKmt, globalKmt);
+  if (FAILED(hr))
+    return hr;
+
+  const uint64_t size = SharedBufferBackingSize(*pDesc);
+  HANDLE mapping = CreateFileMappingA(
+      INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, uint32_t(size >> 32), uint32_t(size), mappingName
+  );
+  if (!mapping) {
+    ERR("SharedBuffer: Failed to create the file mapping for a shared buffer");
+    return E_FAIL;
+  }
+  void *memory = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, size);
+  if (!memory) {
+    ERR("SharedBuffer: Failed to map the shared buffer");
+    CloseHandle(mapping);
+    return E_FAIL;
+  }
+
+  *ppBuffer = reinterpret_cast<ID3D11Buffer *>(
+      ref(new D3D11Buffer(pDesc, pInitialData, pDevice, mapping, memory, localKmt, globalKmt))
+  );
+  return S_OK;
+}
+
+HRESULT
+ImportSharedBuffer(
+    MTLD3D11Device *pDevice, const D3D11_BUFFER_DESC &desc, const char *mappingName, REFIID riid, void **ppResource
+) {
+  HANDLE mapping = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, mappingName);
+  if (!mapping) {
+    ERR("ImportSharedBuffer: Failed to open the shared buffer mapping");
+    return E_INVALIDARG;
+  }
+  void *memory = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, SharedBufferBackingSize(desc));
+  if (!memory) {
+    ERR("ImportSharedBuffer: Failed to map the shared buffer");
+    CloseHandle(mapping);
+    return E_INVALIDARG;
+  }
+
+  // The importing side doesn't own the D3DKMT resource, so it passes no handles.
+  Com<ID3D11Buffer> buffer = reinterpret_cast<ID3D11Buffer *>(
+      ref(new D3D11Buffer(&desc, nullptr, pDevice, mapping, memory, 0, 0))
+  );
+  return buffer->QueryInterface(riid, ppResource);
+}
+
 HRESULT
 CreateBuffer(
     MTLD3D11Device *pDevice, const D3D11_BUFFER_DESC *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData,
     ID3D11Buffer **ppBuffer
 ) {
+  constexpr UINT sharedFlags =
+      D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+  if (pDesc->MiscFlags & sharedFlags)
+    return CreateSharedBuffer(pDevice, pDesc, pInitialData, ppBuffer);
+
   *ppBuffer = reinterpret_cast<ID3D11Buffer *>(ref(new D3D11Buffer(pDesc, pInitialData, pDevice)));
   return S_OK;
 }

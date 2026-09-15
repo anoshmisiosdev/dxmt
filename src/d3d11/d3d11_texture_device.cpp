@@ -6,6 +6,7 @@
 #include "dxmt_staging.hpp"
 #include "dxmt_texture.hpp"
 #include "d3d11_resource.hpp"
+#include "d3d11_shared_buffer.hpp"
 #include "util_win32_compat.h"
 #include <cstddef>
 
@@ -594,6 +595,7 @@ struct SharedResourceInfo {
     D3D11_TEXTURE2D_DESC1 desc2d;
     D3D11_TEXTURE3D_DESC1 desc3d;
   } desc = {};
+  D3D11_BUFFER_DESC buffer_desc = {};
   D3DKMT_HANDLE keyed_mutex_global = 0;
   D3DKMT_HANDLE sync_object_global = 0;
   bool has_keyed_mutex_event = false;
@@ -619,6 +621,9 @@ NormalizeSharedResourceData(const SharedResourceData &runtimeData, UINT size, Sh
       return true;
     case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
       UpgradeResourceDescription(&runtimeData.wine_desc.d3d11_3d, info.desc.desc3d);
+      return true;
+    case D3D11_RESOURCE_DIMENSION_BUFFER:
+      info.buffer_desc = runtimeData.wine_desc.d3d11_buf;
       return true;
     default:
       return false;
@@ -683,6 +688,75 @@ FillWineSharedResourceDesc(WineD3DKMTD3D11Desc &wineDesc, const desc_t &desc, D3
     wineDesc.dimension = D3D11_RESOURCE_DIMENSION_TEXTURE3D;
     wineDesc.d3d11_3d = desc3d;
   }
+}
+
+/*
+ * Shared buffers. Metal cannot share an MTLBuffer between processes, so the pages
+ * come from a named Win32 file mapping created by the caller; only its name and the
+ * buffer description travel in the D3DKMT private runtime data. See
+ * d3d11_shared_buffer.hpp.
+ */
+static void
+FillWineSharedBufferDesc(WineD3DKMTD3D11Desc &wineDesc, const D3D11_BUFFER_DESC &desc, bool ntSecuritySharing) {
+  wineDesc.dxgi.size = sizeof(WineD3DKMTD3D11Desc);
+  wineDesc.dxgi.version = 1;
+  wineDesc.dxgi.width = desc.ByteWidth;
+  wineDesc.dxgi.height = 1;
+  wineDesc.dxgi.format = DXGI_FORMAT_UNKNOWN;
+  wineDesc.dxgi.keyed_mutex = 0;
+  wineDesc.dxgi.mutex_handle = 0;
+  wineDesc.dxgi.sync_handle = 0;
+  wineDesc.dxgi.nt_shared = ntSecuritySharing ? 1 : 0;
+  wineDesc.dimension = D3D11_RESOURCE_DIMENSION_BUFFER;
+  wineDesc.d3d11_buf = desc;
+}
+
+HRESULT
+CreateSharedBufferKmtResource(
+    MTLD3D11Device *pDevice, const D3D11_BUFFER_DESC &desc, bool ntSecuritySharing, char (&mappingNameOut)[54],
+    D3DKMT_HANDLE &localOut, D3DKMT_HANDLE &globalOut
+) {
+  localOut = 0;
+  globalOut = 0;
+
+  auto local_kmt = pDevice->GetLocalD3DKMT();
+  if (!local_kmt) {
+    ERR("SharedBuffer: Invalid device handle");
+    return E_FAIL;
+  }
+
+  SharedResourceData runtimeData = {};
+  FillWineSharedBufferDesc(runtimeData.wine_desc, desc, ntSecuritySharing);
+  MakeUniqueSharedName(runtimeData.mach_port_name);
+  memcpy(mappingNameOut, runtimeData.mach_port_name, sizeof(mappingNameOut));
+
+  D3DKMT_CREATEALLOCATION create = {};
+  create.hDevice = local_kmt;
+  create.pPrivateRuntimeData = &runtimeData;
+  create.PrivateRuntimeDataSize = sizeof(runtimeData);
+  create.Flags.StandardAllocation = 1;
+  create.NumAllocations = 1;
+  D3DDDI_ALLOCATIONINFO allocationInfo = {};
+  create.pAllocationInfo = &allocationInfo;
+  D3DKMT_CREATESTANDARDALLOCATION standardAllocation = {};
+  create.pStandardAllocation = &standardAllocation;
+  standardAllocation.Type = D3DKMT_STANDARDALLOCATIONTYPE_EXISTINGHEAP;
+  standardAllocation.ExistingHeapData.Size = AlignD3DKMTExistingHeapSize(desc.ByteWidth);
+  create.Flags.ExistingSysMem = 1;
+  alignas(kD3DKMTExistingHeapPageSize) static const char systemMem[kD3DKMTExistingHeapPageSize] = {};
+  allocationInfo.pSystemMem = systemMem;
+  create.Flags.CreateResource = 1;
+  create.Flags.CreateShared = 1;
+  create.Flags.NtSecuritySharing = ntSecuritySharing;
+
+  if (D3DKMTCreateAllocation2(&create)) {
+    ERR("SharedBuffer: Failed to create D3DKMT resource for shared buffer");
+    return E_FAIL;
+  }
+
+  localOut = create.hResource;
+  globalOut = create.hGlobalShare;
+  return S_OK;
 }
 
 static WMT::Reference<WMT::SharedEvent>
@@ -1127,6 +1201,9 @@ ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void
     return E_INVALIDARG;
   }
 
+  if (runtimeInfo.dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
+    return ImportSharedBuffer(pDevice, runtimeInfo.buffer_desc, runtimeInfo.mach_port_name, riid, ppTexture);
+
   D3DKMT_HANDLE keyedMutex = 0;
   D3DKMT_HANDLE syncObject = 0;
   WMT::Reference<WMT::SharedEvent> keyedMutexEvent;
@@ -1248,6 +1325,12 @@ ImportSharedTextureFromNtHandle(MTLD3D11Device *pDevice, HANDLE hResource, REFII
     DestroyD3DKMTKeyedMutex(open.hKeyedMutex);
     DestroyD3DKMTSyncObject(open.hSyncObject);
     return E_INVALIDARG;
+  }
+
+  if (runtimeInfo.dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+    DestroyD3DKMTKeyedMutex(open.hKeyedMutex);
+    DestroyD3DKMTSyncObject(open.hSyncObject);
+    return ImportSharedBuffer(pDevice, runtimeInfo.buffer_desc, runtimeInfo.mach_port_name, riid, ppTexture);
   }
 
   mach_port_t mach_port;
