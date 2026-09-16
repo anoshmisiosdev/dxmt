@@ -4306,6 +4306,7 @@ ArgumentEncodingContext::appendComputeArgumentBufferBindings(ComputeEncoderData 
 QueryReadbacks
 ArgumentEncodingContext::flushCommands(
     WMT::CommandBuffer cmdbuf, uint64_t seqId, uint64_t event_seq_id,
+    uint64_t previous_event_seq_id,
     CommandBufferDiagnosticInfo *diagnostic_info) {
   assert(!encoder_current);
 
@@ -4462,8 +4463,15 @@ ArgumentEncodingContext::flushCommands(
       fence_preparation.external_blit_wait_count ||
       fence_preparation.external_explicit_barrier_wait_count ||
       (force_cross_submit_wait && fence_preparation.external_wait_count);
-  if (encode_cross_submit_wait && event_seq_id > 1)
-    cmdbuf.encodeWaitForEvent(queue_.event, event_seq_id - 1);
+  // Wait on the previous command buffer's completion value, never on
+  // event_seq_id - 1. The event id counter is shared between end-of-buffer
+  // signals and the explicit signalEvent() ops that D3D11 query End() emits
+  // inside a buffer, so event_seq_id - 1 is routinely a signal encoded in
+  // *this* buffer -- waiting on it deadlocks the buffer against itself and
+  // wedges the shared event permanently (SteamVR's compositor spins forever in
+  // CGraphicsDevice::WaitForPresent as a result).
+  if (encode_cross_submit_wait && previous_event_seq_id)
+    cmdbuf.encodeWaitForEvent(queue_.event, previous_event_seq_id);
   if (diagnostic_info) {
     diagnostic_info->skipped_external_fence_wait_count =
         encode_cross_submit_wait ? 0 : fence_preparation.external_wait_count;

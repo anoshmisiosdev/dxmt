@@ -97,7 +97,8 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
   list_enc.execute(enc);
   attached_cmdbuf = cmdbuf;
   auto t1 = clock::now();
-  readback = enc.flushCommands(cmdbuf, chunk_id, chunk_event_id, &diagnostic);
+  readback = enc.flushCommands(cmdbuf, chunk_id, chunk_event_id,
+                               previous_chunk_event_id, &diagnostic);
   auto t2 = clock::now();
 
   diagnostic.sparse_mapping_call_count =
@@ -443,7 +444,9 @@ CommandQueue::CommitCurrentChunkForFrame(uint64_t frame_id) {
   auto chunk_id = ready_for_encode.load(std::memory_order_relaxed);
   auto &chunk = chunks[chunk_id % kCommandChunkCount];
   chunk.chunk_id = chunk_id;
+  chunk.previous_chunk_event_id = last_chunk_event_seq_id_;
   chunk.chunk_event_id = GetNextEventSeqId();
+  last_chunk_event_seq_id_ = chunk.chunk_event_id;
   chunk.frame_ = frame_id;
   chunk.publish_time = clock::now();
   chunk.resource_initializer_event_id = initializer.flushToWait();

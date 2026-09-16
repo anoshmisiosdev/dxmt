@@ -136,6 +136,19 @@ public:
 
   uint64_t chunk_id;
   uint64_t chunk_event_id;
+  /**
+  The chunk_event_id of the command buffer submitted immediately before this
+  one, or 0 if this is the first.
+
+  Event ids are drawn from a single counter that is shared between end-of-
+  command-buffer signals (chunk_event_id) and the explicit signalEvent() ops
+  that D3D11 query End() emits *inside* a command buffer. chunk_event_id - 1
+  is therefore not necessarily a value an earlier command buffer signals -- it
+  is frequently the id of a signalEvent() encoded in this very buffer. Waiting
+  on it deadlocks the buffer against itself. Only a previous chunk's
+  chunk_event_id is guaranteed to be signalled by an earlier submission.
+  */
+  uint64_t previous_chunk_event_id;
   uint64_t frame_;
   uint64_t signal_frame_latency_fence_;
   clock::time_point publish_time;
@@ -284,6 +297,9 @@ public:
   ArgumentEncodingContext argument_encoding_ctx;
   WMT::Reference<WMT::SharedEvent> event;
   std::uint64_t current_event_seq_id = 0;
+  // chunk_event_id of the most recently committed chunk. Written only by the
+  // app thread in CommitCurrentChunk, alongside current_event_seq_id.
+  std::uint64_t last_chunk_event_seq_id_ = 0;
   FrameStatisticsContainer statistics;
   ResourceInitializer initializer;
 
@@ -321,6 +337,11 @@ public:
   uint64_t
   GetNextEventSeqId() {
     return ++current_event_seq_id;
+  };
+
+  uint64_t
+  LastChunkEventSeqId() {
+    return last_chunk_event_seq_id_;
   };
 
   uint64_t

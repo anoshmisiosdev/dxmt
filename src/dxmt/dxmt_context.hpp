@@ -1170,6 +1170,7 @@ public:
 
   QueryReadbacks flushCommands(
       WMT::CommandBuffer cmdbuf, uint64_t seqId, uint64_t event_seq_id,
+      uint64_t previous_event_seq_id,
       CommandBufferDiagnosticInfo *diagnostic_info = nullptr);
 
   uint64_t currentSeqId() {return seq_id_;}
